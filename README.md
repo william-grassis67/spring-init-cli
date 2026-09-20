@@ -56,7 +56,7 @@ spring-init/
 ## Instalação
 
 ```bash
-git clone <url-do-seu-repositorio> spring-init
+git clone https://github.com/william-grassis67/spring-init-cli.git spring-init
 cd spring-init
 chmod +x install.sh
 ./install.sh
