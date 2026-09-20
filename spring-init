@@ -1,0 +1,1008 @@
+#!/usr/bin/env bash
+#
+# spring-init - Interactive Spring Initializr for the terminal
+#
+# Creates Spring Boot projects using the official Spring Initializr API
+# (https://start.spring.io) directly from a Fedora / Linux terminal.
+#
+# Usage:
+#   spring-init
+#   spring-init <project-name>
+#   spring-init <project-name> --quick
+#   spring-init --help
+#   spring-init --version
+#   spring-init --debug
+#
+set -Eeuo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+readonly SPRING_INIT_VERSION="1.0.0"
+readonly SPRING_INITIALIZR_HOST="https://start.spring.io"
+readonly CONFIG_DIR="${HOME}/.config/spring-init"
+readonly CONFIG_FILE="${CONFIG_DIR}/config"
+
+DEBUG=0
+QUICK_MODE=0
+CLI_PROJECT_NAME=""
+TMP_DIR=""
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+setup_colors() {
+    if [[ -t 1 ]]; then
+        RESET=$'\033[0m'
+        BOLD=$'\033[1m'
+        DIM=$'\033[2m'
+        RED=$'\033[31m'
+        GREEN=$'\033[32m'
+        YELLOW=$'\033[33m'
+        BLUE=$'\033[34m'
+        MAGENTA=$'\033[35m'
+        CYAN=$'\033[36m'
+        WHITE=$'\033[37m'
+        GRAY=$'\033[90m'
+    else
+        RESET=""; BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""
+        BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; GRAY=""
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Symbols (UTF-8 detection with ASCII fallback)
+# ---------------------------------------------------------------------------
+setup_symbols() {
+    local charmap=""
+    charmap="$(locale charmap 2>/dev/null || true)"
+    if [[ "${charmap}" == "UTF-8" ]] || [[ "${LANG:-}" == *UTF-8* ]] || [[ "${LC_ALL:-}" == *UTF-8* ]]; then
+        CHECK="✓"; CROSS="✗"; ARROW="→"; BULLET="•"; WARN="⚠"; BOX_CHK="[x]"; BOX_UNCHK="[ ]"
+    else
+        CHECK="[OK]"; CROSS="[X]"; ARROW="->"; BULLET="*"; WARN="[!]"; BOX_CHK="[x]"; BOX_UNCHK="[ ]"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+msg_info()    { printf '%s%s%s %s\n' "${CYAN}" "${ARROW}" "${RESET}" "$1"; }
+msg_success() { printf '%s%s%s %s\n' "${GREEN}" "${CHECK}" "${RESET}" "$1"; }
+msg_error()   { printf '%s%s%s %s\n' "${RED}" "${CROSS}" "${RESET}" "$1" >&2; }
+msg_warn()    { printf '%s%s%s %s\n' "${YELLOW}" "${WARN}" "${RESET}" "$1"; }
+msg_bullet()  { printf '  %s %s\n' "${BULLET}" "$1"; }
+msg_line()    { printf '%s\n' "$1"; }
+
+die() {
+    msg_error "$1"
+    exit "${2:-1}"
+}
+
+debug_log() {
+    if [[ "${DEBUG}" -eq 1 ]]; then
+        printf '%s[debug]%s %s\n' "${GRAY}" "${RESET}" "$1" >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Error handling / cleanup
+# ---------------------------------------------------------------------------
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    msg_error "Ocorreu um erro inesperado (linha ${line_no})."
+    if [[ "${DEBUG}" -eq 1 ]]; then
+        msg_error "Exit code: ${exit_code}"
+    else
+        msg_line "${GRAY}Execute com --debug para mais detalhes.${RESET}"
+    fi
+    cleanup
+    exit "${exit_code}"
+}
+
+cleanup() {
+    if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
+        rm -rf -- "${TMP_DIR}"
+    fi
+}
+
+trap 'on_error ${LINENO}' ERR
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+show_banner() {
+    printf '%s%s' "${CYAN}" "${BOLD}"
+    cat <<'EOF'
+   _____ _____  _____  _____ _   _  _____
+  / ____|  __ \|  __ \|_   _| \ | |/ ____|
+ | (___ | |__) | |__) | | | |  \| | |  __
+  \___ \|  ___/|  _  /  | | | . ` | | |_ |
+  ____) | |    | | \ \ _| |_| |\  | |__| |
+ |_____/|_|    |_|  \_\_____|_| \_|\_____|
+EOF
+    printf '%s\n' "${RESET}"
+    printf '%s%s              SPRING INITIALIZER (terminal)%s\n\n' "${BOLD}" "${WHITE}" "${RESET}"
+}
+
+draw_line() {
+    local width="${1:-56}"
+    local ch="${2:--}"
+    printf '%s' "${GRAY}"
+    printf "%${width}s" "" | tr ' ' "${ch}"
+    printf '%s\n' "${RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+check_dependencies() {
+    local missing=0
+
+    if ! command -v curl >/dev/null 2>&1; then
+        msg_error "curl não encontrado."
+        msg_line "  Instale com: ${BOLD}sudo dnf install curl${RESET}"
+        missing=1
+    fi
+
+    if ! command -v unzip >/dev/null 2>&1; then
+        msg_error "unzip não encontrado."
+        msg_line "  Instale com: ${BOLD}sudo dnf install unzip${RESET}"
+        missing=1
+    fi
+
+    if ! command -v java >/dev/null 2>&1; then
+        msg_error "Java não encontrado."
+        msg_line "  Instale um JDK, por exemplo: ${BOLD}sudo dnf install java-21-openjdk${RESET}"
+        missing=1
+    else
+        local java_version_line
+        java_version_line="$(java -version 2>&1 | head -n1 || true)"
+        msg_success "Java encontrado:"
+        msg_line "  ${DIM}${java_version_line}${RESET}"
+    fi
+
+    if [[ "${missing}" -eq 1 ]]; then
+        die "Ferramentas essenciais ausentes. Instale-as e tente novamente."
+    fi
+}
+
+check_internet() {
+    msg_info "Verificando conexão com o Spring Initializr..."
+    if ! curl -fsS --max-time 6 -o /dev/null "${SPRING_INITIALIZR_HOST}"; then
+        die "Não foi possível conectar ao Spring Initializr (${SPRING_INITIALIZR_HOST}). Verifique sua conexão com a internet."
+    fi
+    msg_success "Conectado ao Spring Initializr."
+}
+
+# ---------------------------------------------------------------------------
+# Config handling
+# ---------------------------------------------------------------------------
+CFG_JAVA="21"
+CFG_BUILD="maven"
+CFG_PACKAGING="jar"
+CFG_GROUP="com.example"
+CFG_LANGUAGE="java"
+
+load_config() {
+    mkdir -p "${CONFIG_DIR}"
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        local key value
+        while IFS='=' read -r key value || [[ -n "${key}" ]]; do
+            [[ -z "${key}" || "${key}" == \#* ]] && continue
+            case "${key}" in
+                default_java) CFG_JAVA="${value}" ;;
+                default_build) CFG_BUILD="${value}" ;;
+                default_packaging) CFG_PACKAGING="${value}" ;;
+                default_group) CFG_GROUP="${value}" ;;
+                default_language) CFG_LANGUAGE="${value}" ;;
+            esac
+        done < "${CONFIG_FILE}"
+    else
+        save_config
+    fi
+}
+
+save_config() {
+    mkdir -p "${CONFIG_DIR}"
+    cat > "${CONFIG_FILE}" <<EOF
+# spring-init configuration
+default_java=${CFG_JAVA}
+default_build=${CFG_BUILD}
+default_packaging=${CFG_PACKAGING}
+default_group=${CFG_GROUP}
+default_language=${CFG_LANGUAGE}
+EOF
+}
+
+show_settings_menu() {
+    local choice
+    while true; do
+        printf '\n'
+        draw_line
+        printf '%s%sConfigurações atuais%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+        draw_line
+        msg_bullet "Java padrão:      ${CFG_JAVA}"
+        msg_bullet "Build padrão:     ${CFG_BUILD}"
+        msg_bullet "Packaging padrão: ${CFG_PACKAGING}"
+        msg_bullet "Group padrão:     ${CFG_GROUP}"
+        msg_bullet "Language padrão:  ${CFG_LANGUAGE}"
+        printf '\n'
+        msg_line "1) Alterar Java padrão"
+        msg_line "2) Alterar Build padrão"
+        msg_line "3) Alterar Packaging padrão"
+        msg_line "4) Alterar Group padrão"
+        msg_line "5) Alterar Language padrão"
+        msg_line "6) Voltar"
+        printf '\n'
+        read -r -p "Escolha: " choice || true
+        case "${choice}" in
+            1) read -r -p "Java (17/21/25): " CFG_JAVA; save_config ;;
+            2) read -r -p "Build (maven/gradle): " CFG_BUILD; save_config ;;
+            3) read -r -p "Packaging (jar/war): " CFG_PACKAGING; save_config ;;
+            4) read -r -p "Group (ex: com.example): " CFG_GROUP; save_config ;;
+            5) read -r -p "Language (java/kotlin/groovy): " CFG_LANGUAGE; save_config ;;
+            6) return 0 ;;
+            *) msg_warn "Opção inválida." ;;
+        esac
+    done
+}
+
+show_about() {
+    printf '\n'
+    draw_line
+    printf '%s%sspring-init%s v%s\n' "${BOLD}" "${WHITE}" "${RESET}" "${SPRING_INIT_VERSION}"
+    draw_line
+    msg_line "Um Spring Initializr interativo para o terminal."
+    msg_line "Usa a API oficial: ${SPRING_INITIALIZR_HOST}"
+    msg_line "Feito em Bash puro, sem dependências pesadas."
+    printf '\n'
+}
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+validate_project_name() {
+    local name="$1"
+    if [[ -z "${name}" ]]; then
+        return 1
+    fi
+    if [[ ! "${name}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        return 1
+    fi
+    if [[ "${name}" == .* || "${name}" == *..* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+validate_group_id() {
+    local group="$1"
+    [[ "${group}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$ ]]
+}
+
+sanitize_package_segment() {
+    # lowercase, strip hyphens/underscores, keep only [a-z0-9]
+    local input="$1"
+    input="${input,,}"
+    input="${input//-/}"
+    input="${input//_/}"
+    input="$(printf '%s' "${input}" | tr -cd 'a-z0-9')"
+    printf '%s' "${input}"
+}
+
+url_encode() {
+    # Percent-encode a string for safe use in a query string.
+    local raw="$1"
+    local out=""
+    local i c
+    local len=${#raw}
+    for (( i=0; i<len; i++ )); do
+        c="${raw:i:1}"
+        case "${c}" in
+            [a-zA-Z0-9.~_-]) out+="${c}" ;;
+            *) out+=$(printf '%%%02X' "'${c}") ;;
+        esac
+    done
+    printf '%s' "${out}"
+}
+
+# ---------------------------------------------------------------------------
+# Metadata (Spring Initializr) handling
+# ---------------------------------------------------------------------------
+METADATA_FILE=""
+
+fetch_metadata() {
+    METADATA_FILE="${TMP_DIR}/metadata.json"
+    msg_info "Consultando metadados do Spring Initializr..."
+    if ! curl -fsSL --max-time 15 -H "Accept: application/json" \
+        "${SPRING_INITIALIZR_HOST}/metadata/client" -o "${METADATA_FILE}"; then
+        msg_warn "Não foi possível obter os metadados dinâmicos. Usando valores de fallback."
+        METADATA_FILE=""
+    fi
+}
+
+# Extracts a balanced top-level JSON object for a given key, e.g. "bootVersion": { ... }
+json_extract_block() {
+    local key="$1"
+    local file="$2"
+    [[ -z "${file}" || ! -f "${file}" ]] && return 1
+    awk -v key="\"${key}\"" '
+        BEGIN { found = 0; depth = 0 }
+        {
+            if (!found) {
+                if (index($0, key) > 0) {
+                    found = 1
+                } else {
+                    next
+                }
+            }
+            print $0
+            line = $0
+            opens = gsub(/{/, "{", line)
+            line2 = $0
+            closes = gsub(/}/, "}", line2)
+            depth += opens
+            depth -= closes
+            if (found && depth <= 0) {
+                exit
+            }
+        }
+    ' "${file}"
+}
+
+json_block_default() {
+    # Extracts the "default":"value" from a JSON block
+    grep -m1 -oP '"default"\s*:\s*"\K[^"]+' <<< "$1" 2>/dev/null || true
+}
+
+json_block_ids() {
+    # Extracts all "id":"value" occurrences from a JSON block
+    grep -oP '"id"\s*:\s*"\K[^"]+' <<< "$1" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Project answers (state)
+# ---------------------------------------------------------------------------
+ANS_NAME=""
+ANS_ARTIFACT=""
+ANS_GROUP=""
+ANS_PACKAGE=""
+ANS_BOOT_VERSION=""
+ANS_JAVA=""
+ANS_BUILD=""
+ANS_LANGUAGE=""
+ANS_PACKAGING=""
+ANS_DEPS=()
+ANS_DEPS_NAMES=()
+
+ask_project_name() {
+    local default_name="${1:-meu-projeto}"
+    local input
+    while true; do
+        read -r -p "Nome do projeto [${default_name}]: " input || true
+        input="${input:-${default_name}}"
+        if validate_project_name "${input}"; then
+            ANS_NAME="${input}"
+            break
+        fi
+        msg_warn "Nome inválido. Use apenas letras, números, hífen e underscore."
+    done
+}
+
+ask_artifact_id() {
+    local default_artifact="${ANS_NAME}"
+    local input
+    while true; do
+        read -r -p "Artifact ID [${default_artifact}]: " input || true
+        input="${input:-${default_artifact}}"
+        if validate_project_name "${input}"; then
+            ANS_ARTIFACT="${input}"
+            break
+        fi
+        msg_warn "Artifact ID inválido."
+    done
+}
+
+ask_group_id() {
+    local default_group="${CFG_GROUP}"
+    local input
+    while true; do
+        read -r -p "Group ID [${default_group}]: " input || true
+        input="${input:-${default_group}}"
+        if validate_group_id "${input}"; then
+            ANS_GROUP="${input}"
+            break
+        fi
+        msg_warn "Group ID inválido (ex: com.example)."
+    done
+}
+
+ask_package_name() {
+    local artifact_clean
+    artifact_clean="$(sanitize_package_segment "${ANS_ARTIFACT}")"
+    local default_package="${ANS_GROUP}.${artifact_clean}"
+    local input
+    read -r -p "Package name [${default_package}]: " input || true
+    input="${input:-${default_package}}"
+    ANS_PACKAGE="${input}"
+}
+
+ask_boot_version() {
+    local block="" default_ver="" ids=()
+    if [[ -n "${METADATA_FILE}" ]]; then
+        block="$(json_extract_block "bootVersion" "${METADATA_FILE}" || true)"
+        default_ver="$(json_block_default "${block}")"
+        while IFS= read -r line; do
+            [[ -n "${line}" ]] && ids+=("${line}")
+        done < <(json_block_ids "${block}")
+    fi
+
+    if [[ -z "${default_ver}" || "${#ids[@]}" -eq 0 ]]; then
+        msg_warn "Não foi possível determinar versões do Spring Boot dinamicamente."
+        ids=("3.5.0")
+        default_ver="3.5.0"
+    fi
+
+    printf '\n%s%sSpring Boot version%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+    local i=1 idx_default=1
+    for v in "${ids[@]}"; do
+        if [[ "${v}" == "${default_ver}" ]]; then
+            printf '  %d. %s %s(recomendada)%s\n' "${i}" "${v}" "${GREEN}" "${RESET}"
+            idx_default="${i}"
+        else
+            printf '  %d. %s\n' "${i}" "${v}"
+        fi
+        i=$((i+1))
+    done
+
+    local choice
+    read -r -p "Escolha [${idx_default}]: " choice || true
+    choice="${choice:-${idx_default}}"
+    if [[ "${choice}" =~ ^[0-9]+$ ]] && [[ "${choice}" -ge 1 ]] && [[ "${choice}" -le "${#ids[@]}" ]]; then
+        ANS_BOOT_VERSION="${ids[$((choice-1))]}"
+    else
+        ANS_BOOT_VERSION="${default_ver}"
+    fi
+}
+
+ask_java_version() {
+    local block="" ids=()
+    if [[ -n "${METADATA_FILE}" ]]; then
+        block="$(json_extract_block "javaVersion" "${METADATA_FILE}" || true)"
+        while IFS= read -r line; do
+            [[ -n "${line}" ]] && ids+=("${line}")
+        done < <(json_block_ids "${block}")
+    fi
+    if [[ "${#ids[@]}" -eq 0 ]]; then
+        ids=("17" "21" "25")
+    fi
+
+    local installed_java=""
+    if command -v java >/dev/null 2>&1; then
+        installed_java="$(java -version 2>&1 | head -n1 | grep -oP '"\K[0-9]+' || true)"
+    fi
+
+    printf '\n%s%sJava version%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+    local i=1 idx_default=1
+    for v in "${ids[@]}"; do
+        if [[ "${v}" == "${installed_java}" || ( -z "${installed_java}" && "${v}" == "${CFG_JAVA}" ) ]]; then
+            printf '  %d. %s %s(padrão)%s\n' "${i}" "${v}" "${GREEN}" "${RESET}"
+            idx_default="${i}"
+        else
+            printf '  %d. %s\n' "${i}" "${v}"
+        fi
+        i=$((i+1))
+    done
+
+    local choice
+    read -r -p "Escolha [${idx_default}]: " choice || true
+    choice="${choice:-${idx_default}}"
+    if [[ "${choice}" =~ ^[0-9]+$ ]] && [[ "${choice}" -ge 1 ]] && [[ "${choice}" -le "${#ids[@]}" ]]; then
+        ANS_JAVA="${ids[$((choice-1))]}"
+    else
+        ANS_JAVA="${ids[0]}"
+    fi
+}
+
+ask_build_tool() {
+    printf '\n%s%sBuild tool%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+    msg_line "1. Maven"
+    msg_line "2. Gradle"
+    local choice
+    read -r -p "Escolha [1]: " choice || true
+    choice="${choice:-1}"
+    case "${choice}" in
+        2) ANS_BUILD="gradle" ;;
+        *) ANS_BUILD="maven" ;;
+    esac
+}
+
+ask_language() {
+    printf '\n%s%sLanguage%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+    msg_line "1. Java"
+    msg_line "2. Kotlin"
+    msg_line "3. Groovy"
+    local choice
+    read -r -p "Escolha [1]: " choice || true
+    choice="${choice:-1}"
+    case "${choice}" in
+        2) ANS_LANGUAGE="kotlin" ;;
+        3) ANS_LANGUAGE="groovy" ;;
+        *) ANS_LANGUAGE="java" ;;
+    esac
+}
+
+ask_packaging() {
+    printf '\n%s%sPackaging%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+    msg_line "1. Jar"
+    msg_line "2. War"
+    local choice
+    read -r -p "Escolha [1]: " choice || true
+    choice="${choice:-1}"
+    case "${choice}" in
+        2) ANS_PACKAGING="war" ;;
+        *) ANS_PACKAGING="jar" ;;
+    esac
+}
+
+DEP_IDS=(web data-jpa security validation mysql postgresql h2 lombok devtools actuator thymeleaf configuration-processor)
+DEP_NAMES=("Spring Web" "Spring Data JPA" "Spring Security" "Validation" "MySQL Driver" "PostgreSQL Driver" "H2 Database" "Lombok" "Spring Boot DevTools" "Actuator" "Thymeleaf" "Configuration Processor")
+
+select_dependencies() {
+    printf '\n%s%sDependências disponíveis%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+    local i
+    for i in "${!DEP_IDS[@]}"; do
+        printf '  %2d. %s\n' "$((i+1))" "${DEP_NAMES[$i]}"
+    done
+    printf '\n%sDigite os números separados por espaço, "a" para todas ou "n" para nenhuma:%s\n' "${DIM}" "${RESET}"
+
+    local input
+    read -r -p "> " input || true
+    input="${input:-n}"
+
+    ANS_DEPS=()
+    ANS_DEPS_NAMES=()
+
+    if [[ "${input}" == "a" || "${input}" == "A" ]]; then
+        ANS_DEPS=("${DEP_IDS[@]}")
+        ANS_DEPS_NAMES=("${DEP_NAMES[@]}")
+    elif [[ "${input}" == "n" || "${input}" == "N" ]]; then
+        : # nenhuma dependência
+    else
+        local token
+        for token in ${input}; do
+            if [[ "${token}" =~ ^[0-9]+$ ]] && [[ "${token}" -ge 1 ]] && [[ "${token}" -le "${#DEP_IDS[@]}" ]]; then
+                ANS_DEPS+=("${DEP_IDS[$((token-1))]}")
+                ANS_DEPS_NAMES+=("${DEP_NAMES[$((token-1))]}")
+            fi
+        done
+    fi
+
+    printf '\n'
+    if [[ "${#ANS_DEPS_NAMES[@]}" -eq 0 ]]; then
+        msg_line "  ${DIM}Nenhuma dependência selecionada.${RESET}"
+    else
+        local dep
+        for dep in "${ANS_DEPS_NAMES[@]}"; do
+            msg_success "${dep}"
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Summary & confirmation
+# ---------------------------------------------------------------------------
+show_summary() {
+    printf '\n'
+    draw_line 56 "="
+    printf '%s%s%-56s%s\n' "${BOLD}" "${WHITE}" "  PROJECT SUMMARY" "${RESET}"
+    draw_line 56 "="
+    msg_bullet "Name:        ${ANS_NAME}"
+    msg_bullet "Group:       ${ANS_GROUP}"
+    msg_bullet "Artifact:    ${ANS_ARTIFACT}"
+    msg_bullet "Package:     ${ANS_PACKAGE}"
+    msg_bullet "Java:        ${ANS_JAVA}"
+    msg_bullet "Spring Boot: ${ANS_BOOT_VERSION}"
+    msg_bullet "Language:    ${ANS_LANGUAGE}"
+    msg_bullet "Build:       ${ANS_BUILD}"
+    msg_bullet "Packaging:   ${ANS_PACKAGING}"
+    printf '\n  Dependencies:\n'
+    if [[ "${#ANS_DEPS_NAMES[@]}" -eq 0 ]]; then
+        msg_line "    ${DIM}(nenhuma)${RESET}"
+    else
+        local dep
+        for dep in "${ANS_DEPS_NAMES[@]}"; do
+            printf '    %s%s%s %s\n' "${GREEN}" "${CHECK}" "${RESET}" "${dep}"
+        done
+    fi
+    draw_line 56 "="
+}
+
+confirm_creation() {
+    local answer
+    read -r -p "Criar projeto? [y/N] " answer || true
+    case "${answer}" in
+        y|Y|yes|YES|s|S|sim|SIM) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Target directory handling
+# ---------------------------------------------------------------------------
+resolve_target_dir() {
+    local target="./${ANS_NAME}"
+    while [[ -e "${target}" ]]; do
+        msg_warn "A pasta \"${ANS_NAME}\" já existe."
+        msg_line "1. Cancelar"
+        msg_line "2. Escolher outro nome"
+        msg_line "3. Sobrescrever"
+        local choice
+        read -r -p "Escolha: " choice || true
+        case "${choice}" in
+            1)
+                msg_line "Operação cancelada."
+                return 1
+                ;;
+            2)
+                ask_project_name "${ANS_NAME}-novo"
+                target="./${ANS_NAME}"
+                ;;
+            3)
+                local confirm
+                read -r -p "Digite OVERWRITE para confirmar: " confirm || true
+                if [[ "${confirm}" == "OVERWRITE" ]]; then
+                    rm -rf -- "${target}"
+                else
+                    msg_warn "Confirmação inválida. Nada foi apagado."
+                fi
+                ;;
+            *)
+                msg_warn "Opção inválida."
+                ;;
+        esac
+    done
+    TARGET_DIR="${target}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Build starter.zip URL and download
+# ---------------------------------------------------------------------------
+build_type_param() {
+    if [[ "${ANS_BUILD}" == "gradle" ]]; then
+        printf 'gradle-project'
+    else
+        printf 'maven-project'
+    fi
+}
+
+generate_project() {
+    local type_param
+    type_param="$(build_type_param)"
+
+    local url="${SPRING_INITIALIZR_HOST}/starter.zip"
+    url+="?type=$(url_encode "${type_param}")"
+    url+="&language=$(url_encode "${ANS_LANGUAGE}")"
+    url+="&bootVersion=$(url_encode "${ANS_BOOT_VERSION}")"
+    url+="&baseDir=$(url_encode "${ANS_NAME}")"
+    url+="&groupId=$(url_encode "${ANS_GROUP}")"
+    url+="&artifactId=$(url_encode "${ANS_ARTIFACT}")"
+    url+="&name=$(url_encode "${ANS_ARTIFACT}")"
+    url+="&description=$(url_encode "Projeto ${ANS_NAME} gerado via spring-init")"
+    url+="&packageName=$(url_encode "${ANS_PACKAGE}")"
+    url+="&packaging=$(url_encode "${ANS_PACKAGING}")"
+    url+="&javaVersion=$(url_encode "${ANS_JAVA}")"
+
+    if [[ "${#ANS_DEPS[@]}" -gt 0 ]]; then
+        local deps_joined
+        deps_joined="$(IFS=,; echo "${ANS_DEPS[*]}")"
+        url+="&dependencies=$(url_encode "${deps_joined}")"
+    fi
+
+    debug_log "URL: ${url}"
+
+    local zip_file="${TMP_DIR}/project.zip"
+
+    msg_info "Gerando projeto Spring Boot..."
+    spinner_start "Baixando dependências..."
+    if ! curl -fL --max-time 60 -o "${zip_file}" "${url}"; then
+        spinner_stop
+        die "Falha ao baixar o projeto no Spring Initializr. Verifique os parâmetros e a conexão."
+    fi
+    spinner_stop
+    msg_success "Download concluído."
+
+    msg_info "Extraindo projeto..."
+    mkdir -p "${TARGET_DIR}"
+    if ! unzip -q -o "${zip_file}" -d "${TARGET_DIR}"; then
+        die "Falha ao extrair o arquivo ZIP do projeto."
+    fi
+    msg_success "Projeto extraído em ${TARGET_DIR}"
+}
+
+# ---------------------------------------------------------------------------
+# Simple spinner
+# ---------------------------------------------------------------------------
+SPINNER_PID=""
+
+spinner_start() {
+    local text="${1:-Aguarde...}"
+    if [[ ! -t 1 ]]; then
+        msg_line "${text}"
+        return 0
+    fi
+    (
+        local frames='|/-\'
+        local i=0
+        while true; do
+            i=$(( (i + 1) % 4 ))
+            printf '\r%s%s%s %s' "${CYAN}" "${frames:$i:1}" "${RESET}" "${text}"
+            sleep 0.15
+        done
+    ) &
+    SPINNER_PID=$!
+    disown "${SPINNER_PID}" 2>/dev/null || true
+}
+
+spinner_stop() {
+    if [[ -n "${SPINNER_PID}" ]]; then
+        kill "${SPINNER_PID}" >/dev/null 2>&1 || true
+        wait "${SPINNER_PID}" 2>/dev/null || true
+        SPINNER_PID=""
+        printf '\r%*s\r' 60 ""
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Post-creation
+# ---------------------------------------------------------------------------
+show_success() {
+    printf '\n'
+    draw_line 56 "="
+    printf '%s%s%-56s%s\n' "${GREEN}" "${BOLD}" "  ${CHECK} PROJECT CREATED SUCCESSFULLY" "${RESET}"
+    draw_line 56 "="
+    msg_line "  Location: ${TARGET_DIR}"
+    printf '\n  Next steps:\n\n'
+    msg_line "    cd ${ANS_NAME}"
+    if [[ "${ANS_BUILD}" == "gradle" ]]; then
+        msg_line "    ./gradlew bootRun"
+        printf '\n  Build:\n\n'
+        msg_line "    ./gradlew build"
+    else
+        msg_line "    ./mvnw spring-boot:run"
+        printf '\n  Build:\n\n'
+        msg_line "    ./mvnw clean package"
+    fi
+    draw_line 56 "="
+}
+
+offer_open_project() {
+    printf '\nAbrir projeto agora?\n'
+    msg_line "1. VS Code"
+    msg_line "2. Terminal"
+    msg_line "3. Não"
+    local choice
+    read -r -p "Escolha [3]: " choice || true
+    choice="${choice:-3}"
+    case "${choice}" in
+        1)
+            if command -v code >/dev/null 2>&1; then
+                code "${TARGET_DIR}" >/dev/null 2>&1 &
+                msg_success "Abrindo no VS Code..."
+            else
+                msg_warn "VS Code não encontrado no PATH."
+            fi
+            ;;
+        2)
+            msg_info "cd ${TARGET_DIR}"
+            ;;
+        *)
+            : # nada
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Full project creation flow
+# ---------------------------------------------------------------------------
+create_project_interactive() {
+    local prefill_name="${1:-}"
+
+    check_internet
+    fetch_metadata
+
+    printf '\n%s%sNovo projeto Spring Boot%s\n' "${BOLD}" "${WHITE}" "${RESET}"
+    ask_project_name "${prefill_name:-meu-projeto}"
+    ask_artifact_id
+    ask_group_id
+    ask_package_name
+    ask_boot_version
+    ask_java_version
+    ask_build_tool
+    ask_language
+    ask_packaging
+    select_dependencies
+
+    show_summary
+    if ! confirm_creation; then
+        msg_line "Operação cancelada."
+        return 0
+    fi
+
+    if ! resolve_target_dir; then
+        return 0
+    fi
+
+    generate_project
+    show_success
+    offer_open_project
+}
+
+create_project_quick() {
+    local name="$1"
+
+    if ! validate_project_name "${name}"; then
+        die "Nome de projeto inválido: ${name}"
+    fi
+
+    check_internet
+    fetch_metadata
+
+    ANS_NAME="${name}"
+    ANS_ARTIFACT="${name}"
+    ANS_GROUP="${CFG_GROUP}"
+    ANS_PACKAGE="${CFG_GROUP}.$(sanitize_package_segment "${name}")"
+    ANS_JAVA="${CFG_JAVA}"
+    ANS_BUILD="maven"
+    ANS_LANGUAGE="java"
+    ANS_PACKAGING="jar"
+    ANS_DEPS=("web")
+    ANS_DEPS_NAMES=("Spring Web")
+
+    local block="" default_ver=""
+    if [[ -n "${METADATA_FILE}" ]]; then
+        block="$(json_extract_block "bootVersion" "${METADATA_FILE}" || true)"
+        default_ver="$(json_block_default "${block}")"
+    fi
+    ANS_BOOT_VERSION="${default_ver:-3.5.0}"
+
+    if ! resolve_target_dir; then
+        return 0
+    fi
+
+    generate_project
+    msg_success "Projeto criado."
+    show_success
+}
+
+# ---------------------------------------------------------------------------
+# Main menu
+# ---------------------------------------------------------------------------
+show_main_menu() {
+    printf '\n'
+    draw_line 40
+    printf '%s%s%-40s%s\n' "${BOLD}" "${WHITE}" "        Novo projeto Spring Boot" "${RESET}"
+    draw_line 40
+    msg_line "  1) Criar projeto"
+    msg_line "  2) Configurações"
+    msg_line "  3) Sobre"
+    msg_line "  4) Sair"
+    draw_line 40
+}
+
+main_menu_loop() {
+    local choice
+    while true; do
+        show_main_menu
+        read -r -p "Escolha: " choice || true
+        case "${choice}" in
+            1) create_project_interactive "${CLI_PROJECT_NAME}" ;;
+            2) show_settings_menu ;;
+            3) show_about ;;
+            4) msg_line "Até logo!"; exit 0 ;;
+            *) msg_warn "Opção inválida." ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Help / version
+# ---------------------------------------------------------------------------
+show_help() {
+    cat <<EOF
+spring-init v${SPRING_INIT_VERSION}
+
+USAGE:
+  spring-init
+  spring-init <project-name>
+  spring-init <project-name> --quick
+
+OPTIONS:
+  --help       Show this help
+  --version    Show version
+  --debug      Show technical details on error
+  --quick      Create a quick Java + Maven + Jar + Spring Web project
+
+EXAMPLES:
+  spring-init
+  spring-init api-clientes
+  spring-init api-clientes --quick
+EOF
+}
+
+show_version() {
+    printf 'spring-init v%s\n' "${SPRING_INIT_VERSION}"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+parse_args() {
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            --version|-v)
+                show_version
+                exit 0
+                ;;
+            --debug)
+                DEBUG=1
+                ;;
+            --quick)
+                QUICK_MODE=1
+                ;;
+            --*)
+                die "Opção desconhecida: ${arg}"
+                ;;
+            *)
+                if [[ -z "${CLI_PROJECT_NAME}" ]]; then
+                    CLI_PROJECT_NAME="${arg}"
+                fi
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+main() {
+    setup_colors
+    setup_symbols
+    parse_args "$@"
+
+    TMP_DIR="$(mktemp -d -t spring-init.XXXXXXXX)"
+    debug_log "TMP_DIR=${TMP_DIR}"
+
+    load_config
+
+    show_banner
+    check_dependencies
+
+    if [[ "${QUICK_MODE}" -eq 1 ]]; then
+        if [[ -z "${CLI_PROJECT_NAME}" ]]; then
+            die "Modo --quick requer um nome de projeto: spring-init <nome> --quick"
+        fi
+        create_project_quick "${CLI_PROJECT_NAME}"
+        exit 0
+    fi
+
+    if [[ -n "${CLI_PROJECT_NAME}" ]]; then
+        if ! validate_project_name "${CLI_PROJECT_NAME}"; then
+            die "Nome de projeto inválido: ${CLI_PROJECT_NAME}"
+        fi
+        create_project_interactive "${CLI_PROJECT_NAME}"
+        exit 0
+    fi
+
+    main_menu_loop
+}
+
+main "$@"
