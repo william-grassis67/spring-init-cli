@@ -326,6 +326,6 @@ se você confirmar explicitamente.
 
 ## Licença
 
-Sinta-se livre para adaptar este projeto conforme a licença que você
-escolher para o seu repositório (MIT é uma boa escolha padrão para esse
-tipo de ferramenta).
+Este projeto está disponível para fins de estudo e desenvolvimento.
+Consulte o repositório para informações sobre o uso e distribuição do projeto.
+
