@@ -152,6 +152,13 @@ check_dependencies() {
         missing=1
     fi
 
+    if ! command -v jq >/dev/null 2>&1; then
+        msg_error "jq não encontrado."
+        msg_line "  jq é usado para interpretar corretamente o JSON de metadados do Spring Initializr."
+        msg_line "  Instale com: ${BOLD}sudo dnf install jq${RESET}"
+        missing=1
+    fi
+
     if ! command -v java >/dev/null 2>&1; then
         msg_error "Java não encontrado."
         msg_line "  Instale um JDK, por exemplo: ${BOLD}sudo dnf install java-21-openjdk${RESET}"
@@ -282,6 +289,20 @@ validate_group_id() {
     [[ "${group}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$ ]]
 }
 
+# Guards against ever sending something that isn't really a Spring Boot
+# version (e.g. a dependency id like "native" or "devtools") to the API.
+# Accepts forms like: 3.5.0 | 3.5.0-SNAPSHOT | 4.0.0-M1 | 3.4.9.RELEASE
+validate_boot_version() {
+    local v="$1"
+    [[ "${v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*$ ]]
+}
+
+# Guards against a Java version that isn't a plain integer (e.g. "17", "21").
+validate_java_version() {
+    local v="$1"
+    [[ "${v}" =~ ^[0-9]{1,3}$ ]]
+}
+
 sanitize_package_segment() {
     # lowercase, strip hyphens/underscores, keep only [a-z0-9]
     local input="$1"
@@ -320,46 +341,34 @@ fetch_metadata() {
         "${SPRING_INITIALIZR_HOST}/metadata/client" -o "${METADATA_FILE}"; then
         msg_warn "Não foi possível obter os metadados dinâmicos. Usando valores de fallback."
         METADATA_FILE=""
+        return 0
+    fi
+    if ! jq -e . "${METADATA_FILE}" >/dev/null 2>&1; then
+        msg_warn "O Spring Initializr retornou um JSON inválido. Usando valores de fallback."
+        METADATA_FILE=""
     fi
 }
 
-# Extracts a balanced top-level JSON object for a given key, e.g. "bootVersion": { ... }
-json_extract_block() {
+# The metadata JSON is parsed with jq, which understands real JSON structure
+# (objects, arrays, nesting) instead of guessing based on brace counting or
+# line position. This guarantees that "bootVersion", "javaVersion",
+# "dependencies", etc. can never bleed into one another, no matter how the
+# API formats or reorders its response.
+
+# metadata_get_default <top-level-key>
+# Reads: .<key>.default  (e.g. .bootVersion.default -> "3.5.0")
+metadata_get_default() {
     local key="$1"
-    local file="$2"
-    [[ -z "${file}" || ! -f "${file}" ]] && return 1
-    awk -v key="\"${key}\"" '
-        BEGIN { found = 0; depth = 0 }
-        {
-            if (!found) {
-                if (index($0, key) > 0) {
-                    found = 1
-                } else {
-                    next
-                }
-            }
-            print $0
-            line = $0
-            opens = gsub(/{/, "{", line)
-            line2 = $0
-            closes = gsub(/}/, "}", line2)
-            depth += opens
-            depth -= closes
-            if (found && depth <= 0) {
-                exit
-            }
-        }
-    ' "${file}"
+    [[ -z "${METADATA_FILE}" ]] && return 1
+    jq -r --arg k "${key}" '.[$k].default // empty' "${METADATA_FILE}" 2>/dev/null
 }
 
-json_block_default() {
-    # Extracts the "default":"value" from a JSON block
-    grep -m1 -oP '"default"\s*:\s*"\K[^"]+' <<< "$1" 2>/dev/null || true
-}
-
-json_block_ids() {
-    # Extracts all "id":"value" occurrences from a JSON block
-    grep -oP '"id"\s*:\s*"\K[^"]+' <<< "$1" 2>/dev/null || true
+# metadata_get_ids <top-level-key>
+# Reads: .<key>.values[].id  (e.g. .bootVersion.values[].id -> one id per line)
+metadata_get_ids() {
+    local key="$1"
+    [[ -z "${METADATA_FILE}" ]] && return 1
+    jq -r --arg k "${key}" '.[$k].values[]?.id // empty' "${METADATA_FILE}" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -430,13 +439,28 @@ ask_package_name() {
 }
 
 ask_boot_version() {
-    local block="" default_ver="" ids=()
+    local default_ver="" ids=() raw_ids=()
+
     if [[ -n "${METADATA_FILE}" ]]; then
-        block="$(json_extract_block "bootVersion" "${METADATA_FILE}" || true)"
-        default_ver="$(json_block_default "${block}")"
+        default_ver="$(metadata_get_default "bootVersion" || true)"
         while IFS= read -r line; do
-            [[ -n "${line}" ]] && ids+=("${line}")
-        done < <(json_block_ids "${block}")
+            [[ -n "${line}" ]] && raw_ids+=("${line}")
+        done < <(metadata_get_ids "bootVersion")
+    fi
+
+    # Defense in depth: only keep entries that actually look like a Spring
+    # Boot version. jq already guarantees these came from bootVersion.values,
+    # but this filter protects against any unexpected/malformed API payload.
+    local v
+    for v in "${raw_ids[@]}"; do
+        if validate_boot_version "${v}"; then
+            ids+=("${v}")
+        else
+            debug_log "Ignorando valor inesperado em bootVersion.values: ${v}"
+        fi
+    done
+    if ! validate_boot_version "${default_ver}"; then
+        default_ver=""
     fi
 
     if [[ -z "${default_ver}" || "${#ids[@]}" -eq 0 ]]; then
@@ -468,14 +492,25 @@ ask_boot_version() {
 }
 
 ask_java_version() {
-    local block="" ids=()
+    local ids=() raw_ids=()
     if [[ -n "${METADATA_FILE}" ]]; then
-        block="$(json_extract_block "javaVersion" "${METADATA_FILE}" || true)"
         while IFS= read -r line; do
-            [[ -n "${line}" ]] && ids+=("${line}")
-        done < <(json_block_ids "${block}")
+            [[ -n "${line}" ]] && raw_ids+=("${line}")
+        done < <(metadata_get_ids "javaVersion")
     fi
+
+    # Defense in depth, same reasoning as in ask_boot_version.
+    local v
+    for v in "${raw_ids[@]}"; do
+        if validate_java_version "${v}"; then
+            ids+=("${v}")
+        else
+            debug_log "Ignorando valor inesperado em javaVersion.values: ${v}"
+        fi
+    done
+
     if [[ "${#ids[@]}" -eq 0 ]]; then
+        msg_warn "Não foi possível determinar versões do Java dinamicamente."
         ids=("17" "21" "25")
     fi
 
@@ -683,6 +718,13 @@ generate_project() {
     local type_param
     type_param="$(build_type_param)"
 
+    if ! validate_boot_version "${ANS_BOOT_VERSION}"; then
+        die "Versão de Spring Boot inválida detectada (\"${ANS_BOOT_VERSION}\"). Abortando por segurança."
+    fi
+    if ! validate_java_version "${ANS_JAVA}"; then
+        die "Versão de Java inválida detectada (\"${ANS_JAVA}\"). Abortando por segurança."
+    fi
+
     local url="${SPRING_INITIALIZR_HOST}/starter.zip"
     url+="?type=$(url_encode "${type_param}")"
     url+="&language=$(url_encode "${ANS_LANGUAGE}")"
@@ -862,12 +904,14 @@ create_project_quick() {
     ANS_DEPS=("web")
     ANS_DEPS_NAMES=("Spring Web")
 
-    local block="" default_ver=""
+    local default_ver=""
     if [[ -n "${METADATA_FILE}" ]]; then
-        block="$(json_extract_block "bootVersion" "${METADATA_FILE}" || true)"
-        default_ver="$(json_block_default "${block}")"
+        default_ver="$(metadata_get_default "bootVersion" || true)"
     fi
-    ANS_BOOT_VERSION="${default_ver:-3.5.0}"
+    if ! validate_boot_version "${default_ver}"; then
+        default_ver="3.5.0"
+    fi
+    ANS_BOOT_VERSION="${default_ver}"
 
     if ! resolve_target_dir; then
         return 0

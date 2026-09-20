@@ -20,6 +20,25 @@ comando) que:
 
 Nada é hardcoded: versões de Spring Boot/Java vêm sempre da API oficial.
 
+### Como os metadados são interpretados
+
+O JSON retornado por `https://start.spring.io/metadata/client` é processado
+com **`jq`**, que entende a estrutura real do documento (objetos, arrays,
+aninhamento) em vez de tentar adivinhar por contagem de chaves ou posição de
+linha. Cada campo é lido pelo seu caminho exato:
+
+- `jq '.bootVersion.default'` / `jq '.bootVersion.values[].id'`
+- `jq '.javaVersion.default'` / `jq '.javaVersion.values[].id'`
+
+Isso garante que versões de Spring Boot, versões de Java, dependências,
+build tools etc. nunca se misturam — cada menu só pode conter valores que
+realmente vieram da seção correspondente do JSON. Como camada extra de
+segurança, cada valor lido ainda passa por um validador de formato
+(`validate_boot_version` / `validate_java_version`) antes de aparecer no
+menu ou ser enviado à API; qualquer coisa fora do padrão esperado (por
+exemplo, um valor não numérico onde se espera uma versão de Java) é
+descartada silenciosamente em vez de quebrar a geração do projeto.
+
 ---
 
 ## Requisitos
@@ -27,12 +46,13 @@ Nada é hardcoded: versões de Spring Boot/Java vêm sempre da API oficial.
 - Bash (`#!/usr/bin/env bash`)
 - `curl`
 - `unzip`
+- `jq` — usado para interpretar corretamente o JSON de metadados do Spring Initializr (versões de Spring Boot e Java). Sem ele o script não roda, pois o parsing de JSON não é feito "na mão".
 - `java` (JDK) — necessário para rodar o projeto gerado, não para gerar o ZIP
 
 No Fedora:
 
 ```bash
-sudo dnf install curl unzip java-21-openjdk
+sudo dnf install curl unzip jq java-21-openjdk
 ```
 
 O script **verifica** essas dependências antes de começar e informa como

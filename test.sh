@@ -145,6 +145,97 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "9. Parser de metadados (jq) - regressão do bug de mistura de campos"
+# ---------------------------------------------------------------------------
+if ! command -v jq >/dev/null 2>&1; then
+    fail "jq não encontrado (obrigatório para o parser de metadados)"
+else
+    pass "jq disponível no ambiente de teste"
+
+    SAMPLE_JSON="$(mktemp -t spring-init-metadata-test.XXXXXXXX.json)"
+    cat > "${SAMPLE_JSON}" <<'JSONEOF'
+{
+  "dependencies": {
+    "values": [
+      { "name": "Developer Tools", "values": [
+        { "id": "devtools", "name": "Spring Boot DevTools" },
+        { "id": "native", "name": "GraalVM Native Support" },
+        { "id": "dgs-codegen", "name": "Netflix DGS Code Generation" }
+      ]}
+    ]
+  },
+  "javaVersion": {
+    "default": "21",
+    "values": [ { "id": "27" }, { "id": "25" }, { "id": "21" }, { "id": "17" } ]
+  },
+  "bootVersion": {
+    "default": "3.5.0",
+    "values": [
+      { "id": "4.2.0.BUILD-SNAPSHOT" },
+      { "id": "4.1.1.RELEASE" },
+      { "id": "3.5.0" },
+      { "id": "3.4.9" }
+    ]
+  }
+}
+JSONEOF
+
+    boot_default="$(jq -r --arg k "bootVersion" '.[$k].default // empty' "${SAMPLE_JSON}")"
+    if [[ "${boot_default}" == "3.5.0" ]]; then
+        pass "jq extrai corretamente o default de bootVersion"
+    else
+        fail "default de bootVersion incorreto: '${boot_default}'"
+    fi
+
+    mapfile -t boot_ids < <(jq -r --arg k "bootVersion" '.[$k].values[]?.id // empty' "${SAMPLE_JSON}")
+    contaminated=0
+    for id in "${boot_ids[@]}"; do
+        case "${id}" in
+            native|devtools|dgs-codegen|17|21|25|27)
+                contaminated=1
+                ;;
+        esac
+    done
+    if [[ "${contaminated}" -eq 0 && "${#boot_ids[@]}" -eq 4 ]]; then
+        pass "bootVersion.values não contém ids de dependencies/javaVersion (regressão corrigida)"
+    else
+        fail "bootVersion.values contém valores de outras seções: ${boot_ids[*]}"
+    fi
+
+    mapfile -t java_ids < <(jq -r --arg k "javaVersion" '.[$k].values[]?.id // empty' "${SAMPLE_JSON}")
+    contaminated=0
+    for id in "${java_ids[@]}"; do
+        case "${id}" in
+            native|devtools|dgs-codegen) contaminated=1 ;;
+        esac
+    done
+    if [[ "${contaminated}" -eq 0 && "${#java_ids[@]}" -eq 4 ]]; then
+        pass "javaVersion.values não contém ids de dependencies/bootVersion"
+    else
+        fail "javaVersion.values contém valores de outras seções: ${java_ids[*]}"
+    fi
+
+    rm -f -- "${SAMPLE_JSON}"
+fi
+
+# ---------------------------------------------------------------------------
+section "10. Validadores de formato de versão"
+# ---------------------------------------------------------------------------
+validate_boot_version_t() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*$ ]]
+}
+validate_java_version_t() {
+    [[ "$1" =~ ^[0-9]{1,3}$ ]]
+}
+
+if validate_boot_version_t "3.5.0"; then pass "3.5.0 aceito como versão de Spring Boot válida"; else fail "3.5.0 deveria ser válido"; fi
+if validate_boot_version_t "4.1.1.RELEASE"; then pass "4.1.1.RELEASE aceito"; else fail "4.1.1.RELEASE deveria ser válido"; fi
+if ! validate_boot_version_t "native"; then pass "'native' rejeitado como versão de Spring Boot"; else fail "'native' não deveria ser aceito como versão"; fi
+if ! validate_boot_version_t "devtools"; then pass "'devtools' rejeitado como versão de Spring Boot"; else fail "'devtools' não deveria ser aceito como versão"; fi
+if validate_java_version_t "21"; then pass "21 aceito como versão de Java válida"; else fail "21 deveria ser válido"; fi
+if ! validate_java_version_t "dgs-codegen"; then pass "'dgs-codegen' rejeitado como versão de Java"; else fail "'dgs-codegen' não deveria ser aceito"; fi
+
+# ---------------------------------------------------------------------------
 section "Resumo"
 # ---------------------------------------------------------------------------
 printf '\n%d passaram, %d falharam\n' "${PASS}" "${FAIL}"
